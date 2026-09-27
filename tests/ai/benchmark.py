@@ -7,6 +7,7 @@ import urllib.request
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
 MODEL = "qwen3.5:9b"
+#MODEL = "qwen3.5:4b"
 
 GOAL_DISTANCE_CM = 5.0
 ANGLE_TOLERANCE_DEG = 5.0
@@ -719,11 +720,369 @@ def run_phase_2():
         f"{sum(mission_steps) / len(mission_steps):.1f}"
     )
 
+# ============================================================
+# PHASE 3
+# Wording / language robustness
+# ============================================================
+
+def run_robustness_test(
+    name,
+    user_goal,
+    observation,
+    expected_tool,
+    expected_value=None
+):
+    messages = [
+        {
+            "role": "user",
+            "content": user_goal
+        },
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "observe",
+                        "arguments": {}
+                    }
+                }
+            ]
+        },
+        {
+            "role": "tool",
+            "tool_name": "observe",
+            "content": observation
+        }
+    ]
+
+    response, wall_ms = call_model(messages)
+
+    actual_tool, arguments = get_tool_call(response)
+
+    tool_ok = actual_tool == expected_tool
+
+    args_ok = False
+
+    if tool_ok:
+        args_ok = validate_arguments(
+            expected_tool,
+            expected_value,
+            arguments
+        )
+
+    passed = tool_ok and args_ok
+
+    print()
+    print("=" * 70)
+    print(name)
+    print("=" * 70)
+    print(f"Goal           : {user_goal}")
+    print(f"Observation    : {observation}")
+    print(f"Expected tool  : {expected_tool}")
+    print(f"Expected value : {expected_value}")
+    print(f"Actual tool    : {actual_tool}")
+    print(f"Arguments      : {arguments}")
+    print(f"Latency        : {wall_ms:.1f} ms")
+    print(f"Result         : {'PASS' if passed else 'FAIL'}")
+
+    return passed, wall_ms
+
+
+def run_phase_3():
+
+    tests = [
+
+        # ----------------------------------------------------
+        # SAME physical situation:
+        # target is 30 degrees RIGHT
+        # ----------------------------------------------------
+
+        (
+            "Right - normal wording",
+            "Go in front of the dustbin and stop about 5 cm away.",
+            "The dustbin is 30 degrees to the right.",
+            "turn_right",
+            30
+        ),
+
+        (
+            "Right - casual wording",
+            "Drive over to the trash can and stop around 5 cm from it.",
+            "The trash can is off to your right by roughly 30 degrees.",
+            "turn_right",
+            30
+        ),
+
+        (
+            "Right - short wording",
+            "Go to the bin. Stop 5 cm away.",
+            "Bin is about 30 degrees on the right.",
+            "turn_right",
+            30
+        ),
+
+        (
+            "Right - technical wording",
+            "Approach the target and finish 5 cm in front of it.",
+            "Target bearing is +30 degrees, where positive means right.",
+            "turn_right",
+            30
+        ),
+
+        (
+            "Right - different object word",
+            "Position yourself 5 cm in front of the garbage bin.",
+            "The garbage bin appears roughly 30 degrees to your right.",
+            "turn_right",
+            30
+        ),
+
+
+        # ----------------------------------------------------
+        # Target is 30 degrees LEFT
+        # ----------------------------------------------------
+
+        (
+            "Left - normal wording",
+            "Go in front of the dustbin and stop about 5 cm away.",
+            "The dustbin is 30 degrees to the left.",
+            "turn_left",
+            30
+        ),
+
+        (
+            "Left - casual wording",
+            "Drive over to the trash can and stop around 5 cm from it.",
+            "The trash can is off to your left by roughly 30 degrees.",
+            "turn_left",
+            30
+        ),
+
+        (
+            "Left - short wording",
+            "Go to the bin. Stop 5 cm away.",
+            "Bin is about 30 degrees on the left.",
+            "turn_left",
+            30
+        ),
+
+        (
+            "Left - technical wording",
+            "Approach the target and finish 5 cm in front of it.",
+            "Target bearing is -30 degrees, where negative means left.",
+            "turn_left",
+            30
+        ),
+
+        (
+            "Left - different object word",
+            "Position yourself 5 cm in front of the garbage bin.",
+            "The garbage bin appears roughly 30 degrees to your left.",
+            "turn_left",
+            30
+        ),
+
+
+        # ----------------------------------------------------
+        # Centered, but distance unknown
+        # ----------------------------------------------------
+
+        (
+            "Unknown range - normal wording",
+            "Go in front of the dustbin and stop about 5 cm away.",
+            "The dustbin is centered directly ahead. "
+            "Its distance is not known.",
+            "get_distance",
+            None
+        ),
+
+        (
+            "Unknown range - casual wording",
+            "Move up to the trash can and leave about a 5 cm gap.",
+            "The trash can is straight ahead, but I do not know "
+            "how far away it is.",
+            "get_distance",
+            None
+        ),
+
+        (
+            "Unknown range - technical wording",
+            "Approach the target until range is approximately 5 cm.",
+            "Target bearing is zero degrees. Range information "
+            "is unavailable.",
+            "get_distance",
+            None
+        ),
+
+
+        # ----------------------------------------------------
+        # Centered and FAR
+        # ----------------------------------------------------
+
+        (
+            "Far - normal wording",
+            "Go in front of the dustbin and stop about 5 cm away.",
+            "The dustbin is centered directly ahead. "
+            "Ultrasonic distance is 100 cm.",
+            "move_forward",
+            95
+        ),
+
+        (
+            "Far - casual wording",
+            "Drive up to the trash can, but leave a 5 cm gap.",
+            "The trash can is straight in front of you and "
+            "is 100 cm away.",
+            "move_forward",
+            95
+        ),
+
+        (
+            "Far - technical wording",
+            "Approach the target and maintain a final range of 5 cm.",
+            "Target bearing is 0 degrees. Current range is 100 cm.",
+            "move_forward",
+            95
+        ),
+
+        (
+            "Far - alternate units wording",
+            "Get in front of the bin and stop 5 centimeters away.",
+            "The bin is centered. The measured distance "
+            "to it is 100 centimeters.",
+            "move_forward",
+            95
+        ),
+
+
+        # ----------------------------------------------------
+        # Centered and CLOSE
+        # ----------------------------------------------------
+
+        (
+            "Close - normal wording",
+            "Go in front of the dustbin and stop about 5 cm away.",
+            "The dustbin is centered directly ahead. "
+            "Ultrasonic distance is 25 cm.",
+            "move_forward",
+            20
+        ),
+
+        (
+            "Close - casual wording",
+            "Get close to the trash can and leave about 5 cm.",
+            "The trash can is straight ahead and only "
+            "25 cm away.",
+            "move_forward",
+            20
+        ),
+
+        (
+            "Close - technical wording",
+            "Approach the target to a final range of 5 cm.",
+            "Target bearing is zero. Current range is 25 cm.",
+            "move_forward",
+            20
+        ),
+
+
+        # ----------------------------------------------------
+        # Already at target
+        # ----------------------------------------------------
+
+        (
+            "Goal reached - normal wording",
+            "Go in front of the dustbin and stop about 5 cm away.",
+            "The dustbin is centered directly ahead. "
+            "Ultrasonic distance is 5 cm.",
+            "stop",
+            None
+        ),
+
+        (
+            "Goal reached - casual wording",
+            "Drive up to the trash can and leave a 5 cm gap.",
+            "The trash can is directly ahead and exactly "
+            "5 cm away.",
+            "stop",
+            None
+        ),
+
+        (
+            "Goal reached - technical wording",
+            "Approach the target until range is 5 cm.",
+            "Target bearing is zero degrees. "
+            "Current range is 5 cm.",
+            "stop",
+            None
+        )
+    ]
+
+    passed_count = 0
+    latencies = []
+
+    failed_tests = []
+
+    for (
+        name,
+        user_goal,
+        observation,
+        expected_tool,
+        expected_value
+    ) in tests:
+
+        passed, wall_ms = run_robustness_test(
+            name,
+            user_goal,
+            observation,
+            expected_tool,
+            expected_value
+        )
+
+        latencies.append(wall_ms)
+
+        if passed:
+            passed_count += 1
+        else:
+            failed_tests.append(name)
+
+    print()
+    print("#" * 70)
+    print("PHASE 3 RESULTS")
+    print("#" * 70)
+
+    print(
+        f"Passed          : "
+        f"{passed_count} / {len(tests)}"
+    )
+
+    print(
+        f"Success rate    : "
+        f"{100.0 * passed_count / len(tests):.1f}%"
+    )
+
+    print(
+        f"Average latency : "
+        f"{sum(latencies) / len(latencies):.1f} ms"
+    )
+
+    print(
+        f"Worst latency   : "
+        f"{max(latencies):.1f} ms"
+    )
+
+    if failed_tests:
+        print()
+        print("FAILED TESTS:")
+
+        for name in failed_tests:
+            print(f"  - {name}")
 
 # ============================================================
 # MAIN
 # ============================================================
-
 if __name__ == "__main__":
     run_phase_1()
     run_phase_2()
+    run_phase_3()
