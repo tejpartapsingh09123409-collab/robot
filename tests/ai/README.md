@@ -145,3 +145,81 @@ So far, camera information has been simulated as text such as:
 The next test should provide actual camera images to the multimodal model and evaluate whether it can identify the requested object and choose a sensible next primitive.
 
 Once that works sufficiently well, the intelligence investigation should stop expanding and the project should move into the C++/Linux robot integration.
+
+
+## Model size comparison — Qwen3.5 4B vs 9B
+
+After establishing the 9B baseline, the same three benchmark phases were repeated with Qwen3.5 4B to see whether the smaller model could reduce latency without sacrificing too much reliability.
+
+The benchmark itself was kept unchanged so the comparison was fair: same tool definitions, same prompts, same fake-world logic, same temperature setting, and same machine.
+
+### Qwen3.5 4B results
+
+#### Phase 1 — Single-step decisions
+
+- Passed: 3 / 11
+- Average latency: 1924.4 ms
+- Worst latency: 6102.0 ms
+
+The main failure pattern was directional reasoning. The 4B model flipped left and right on all six basic direction tests. It also chose poor forward distances in some far-distance cases.
+
+Examples:
+
+- target 30° right → chose `turn_left(30)`
+- target 30° left → chose `turn_right(30)`
+- 200 cm away → chose `move_forward(100)` instead of approximately 195 cm
+- 100 cm away → chose `move_forward(35)` instead of approximately 95 cm
+
+#### Phase 2 — Multi-step missions
+
+- Passed: 5 / 7 missions
+- Average mission latency: 11101.2 ms
+- Average steps: 5.4
+
+Although individual 4B calls were often faster, the complete missions were slower on average because the model made more mistakes and required more actions.
+
+In one failed mission, the target started 40° to the right. The model initially turned left, increasing the error, later drove forward while still badly misaligned, and eventually stopped at the correct distance while still approximately 80° away from the required heading.
+
+This is a more important failure than merely choosing a conservative movement distance because it shows that the smaller model can make incorrect spatial decisions and continue acting on them.
+
+#### Phase 3 — Wording robustness
+
+- Passed: 17 / 23
+- Success rate: 73.9%
+- Average latency: 1476.1 ms
+- Worst latency: 1888.2 ms
+
+The 4B model was clearly faster in this phase, but its reliability dropped substantially compared with 9B. Failures included incorrect left/right decisions, moving when distance was unknown, and poor movement-distance choices.
+
+### Comparison
+
+| Metric | Qwen3.5 9B | Qwen3.5 4B |
+|---|---:|---:|
+| Phase 1 | 11 / 11 | 3 / 11 |
+| Phase 2 | 7 / 7 | 5 / 7 |
+| Phase 3 | 22 / 23 (95.7%) | 17 / 23 (73.9%) |
+| Phase 2 average mission latency | 8863.1 ms | 11101.2 ms |
+| Phase 2 average steps | 3.6 | 5.4 |
+
+The smaller model reduced latency for many individual calls, but that did not translate into faster task completion. Because it made more mistakes, it required more actions and produced a higher average full-mission latency.
+
+This is an important system-level result:
+
+> Lower model inference latency does not necessarily mean lower robot task latency.
+
+### Decision
+
+Qwen3.5 4B will not be used as the current Milestone 1 baseline.
+
+The reason is not simply that it scored lower. Its failures are in areas that matter directly to safe and useful robot behavior:
+
+- left/right spatial reasoning
+- choosing movement distances
+- knowing when more sensing is required
+- maintaining a correct plan across multiple steps
+
+The 9B model is slower per inference but is significantly more reliable, needs fewer actions to finish a mission, and has been repeatable across multiple benchmark runs.
+
+For now, Qwen3.5 9B remains the baseline. The project will not spend more time tuning the 4B model because the current goal is to validate the overall robot architecture, not optimize a weaker model prematurely.
+
+Optimization can be revisited later if latency becomes a blocking system requirement. Possible future approaches include a different small model, quantization/runtime tuning, reducing model-call frequency, or moving fast continuous control into deterministic C++ while using the model only for higher-level decisions.
