@@ -118,11 +118,73 @@ The one failing test still selected the correct primitive but chose a conservati
 
 This may not represent a true intelligence failure because a closed-loop robot could move partially, observe again, and continue.
 
+## Phase 4 — Real-image vision
+
+Purpose: verify that Qwen3.5 9B can consume an actual camera image rather than a text description of the scene.
+
+Three local webcam images were captured with the same dustbin placed on the left, center, and right of the image. The model was asked to identify the dustbin and classify its coarse horizontal position.
+
+### Result
+
+- Passed: 3 / 3
+- Average latency: 9172.2 ms
+- Worst latency: 12055.4 ms
+
+The model correctly identified all three positions:
+
+- left image → `LEFT`
+- center image → `CENTER`
+- right image → `RIGHT`
+
+This established that the local multimodal path works end to end:
+
+`JPEG image → Ollama → Qwen3.5 9B vision → spatial interpretation`
+
+The vision calls were considerably slower than the earlier text-only calls, so image inference latency remains an important system consideration.
+
+## Phase 5 — Real image to robot primitive
+
+Purpose: test the more relevant question for the robot: given a real-world image, the high-level goal, and the actual primitive interface, can the model choose a sensible next robot action?
+
+A nine-image public test set was built from Open Images waste-container annotations:
+
+- 3 images with the annotated container on the left
+- 3 centered
+- 3 on the right
+
+The expected action was derived from the annotated horizontal location:
+
+- left → `turn_left(...)`
+- center → `get_distance()`
+- right → `turn_right(...)`
+
+The exact turn angle was not graded because an ordinary image annotation gives image position, not calibrated robot bearing.
+
+The model was allowed to call `observe()` again when uncertain. When it did, the benchmark returned the same scene because no physical action had changed the world. A maximum of three decisions was allowed; repeated observation without progress would fail.
+
+### Result
+
+- Passed: 8 / 9
+- Success rate: 88.9%
+- Average total latency: 3405.4 ms
+- Worst total latency: 8283.7 ms
+- Average decisions used: 1.6
+
+Observed behavior included:
+
+- `observe() → turn_left(45)`
+- `observe() → turn_right(15)`
+- centered scenes → `get_distance()` directly
+
+The single nominal failure was a large, nearby waste container whose annotated bounding-box center fell in the left third of the image. The model chose `get_distance()` instead of `turn_left(...)`. Manual inspection showed the object occupied a large part of the image and extended close to the camera center, so the case is ambiguous for the actual robotics question of whether the robot is sufficiently aligned to range the target. It is therefore recorded as a benchmark mismatch rather than strong evidence of a bad navigation decision.
+
+The main conclusion from Phase 5 is that Qwen3.5 9B can usually combine real visual input, the high-level goal, and the robot tool interface to produce a sensible next primitive, including requesting another observation when uncertain.
+
 ## Current conclusion
 
 Qwen3.5 9B running locally through Ollama is good enough to continue with for Milestone 1.
 
-Evidence so far shows that it can:
+Evidence now shows that it can:
 
 - understand the high-level goal
 - select structured robot primitives
@@ -131,20 +193,16 @@ Evidence so far shows that it can:
 - react to tool results
 - complete simulated missions
 - generalize across varied wording
+- interpret real camera images
+- identify coarse target position from real images
+- combine real visual input with the robot primitive interface
+- request another observation when uncertain and then continue toward an action
 
-The main weakness observed so far is latency. Typical calls are often around 1.5–2.5 seconds, with occasional larger spikes.
+The remaining uncertainty is no longer whether the basic AI approach works. The next uncertainty is system integration in the physical loop: camera capture, sensor feedback, primitive execution, state/history, safety checks, and behavior when the real world does not match the model's expectation.
 
-## Remaining intelligence test
+Latency remains the clearest weakness. Text-only calls are often around 1.5–2.5 seconds, while vision calls can be several seconds and occasionally much longer. Fast continuous motion control should therefore remain deterministic rather than depending on a model call for every small correction.
 
-The major unproven part is real vision.
-
-So far, camera information has been simulated as text such as:
-
-`The dustbin is 30 degrees to the right.`
-
-The next test should provide actual camera images to the multimodal model and evaluate whether it can identify the requested object and choose a sensible next primitive.
-
-Once that works sufficiently well, the intelligence investigation should stop expanding and the project should move into the C++/Linux robot integration.
+The intelligence benchmark should stop expanding for now. The project should move into the real C++/Linux robot loop and return to model evaluation only when a concrete integration problem requires it.
 
 
 ## Model size comparison — Qwen3.5 4B vs 9B
