@@ -1,18 +1,57 @@
 #!/usr/bin/env python3
 
+import base64
 import json
+import queue
+import subprocess
+import threading
 import time
+import tkinter as tk
+from pathlib import Path
+from tkinter import messagebox, ttk
 import urllib.request
+import urllib.error
 
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
 MODEL = "qwen3.5:9b"
-#MODEL = "qwen3.5:4b"
 
-GOAL_DISTANCE_CM = 5.0
-ANGLE_TOLERANCE_DEG = 5.0
-DISTANCE_TOLERANCE_CM = 2.0
-MAX_STEPS = 12
+DEFAULT_CAMERA = "/dev/video2"
+MAX_STEPS = 40
+IMAGE_HISTORY_LIMIT = 4
+
+ROBOT_POLICY = """
+You control a mobile robot using ONLY the provided robot primitives.
+
+The user's message gives you the mission goal.
+
+Important interface semantics:
+
+- Choose exactly one primitive per decision.
+- observe() returns the robot's current camera view.
+- get_distance() returns a real distance measurement directly ahead.
+- turn_left(), turn_right(), and move_forward() physically change the robot pose.
+- stop() ends the mission.
+- Do not invent observations, distances, or completed movements. Wait for the
+  environment to return the corresponding tool result.
+- Camera images are observations, not distance measurements. Use get_distance()
+  whenever you need an actual physical distance.
+- After the robot physically moves or turns, an older camera image describes the
+  previous pose. Use fresh observations when you need to know what the robot now
+  sees.
+- Previous observations and actions remain part of the conversation history.
+  Use that history to reason about what has already been seen and done.
+
+You are responsible for the navigation/search strategy and for deciding which
+primitive to call next. The environment does not provide a hard-coded search
+strategy or movement plan.
+
+For this test, a human physically executes movement primitives and supplies
+sensor results. Treat those tool results exactly as real robot feedback.
+""".strip()
+
+CAPTURE_DIR = Path("human_robot_captures")
+CAPTURE_DIR.mkdir(exist_ok=True)
 
 
 TOOLS = [
@@ -20,7 +59,11 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "observe",
-            "description": "Observe the current scene using the robot camera.",
+            "description": (
+                "Capture a new camera observation of the current scene. "
+                "Use this whenever visual information is missing, stale, "
+                "or you want to verify alignment after movement."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {}
@@ -31,7 +74,9 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_distance",
-            "description": "Get ultrasonic distance directly ahead in centimeters.",
+            "description": (
+                "Get the measured distance directly ahead in centimeters."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {}
@@ -42,9 +87,10 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "move_forward",
-            "description":
+            "description": (
                 "Move the robot straight forward by the requested "
-                "distance in centimeters.",
+                "distance in centimeters."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -60,9 +106,10 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "turn_left",
-            "description":
+            "description": (
                 "Turn the robot left/counter-clockwise by the "
-                "requested number of degrees.",
+                "requested number of degrees."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -78,9 +125,10 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "turn_right",
-            "description":
+            "description": (
                 "Turn the robot right/clockwise by the "
-                "requested number of degrees.",
+                "requested number of degrees."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -96,9 +144,9 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "stop",
-            "description":
-                "Stop the robot when the requested destination "
-                "or stopping distance has been reached.",
+            "description": (
+                "Stop when the requested goal has been reached."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {}
@@ -108,981 +156,1630 @@ TOOLS = [
 ]
 
 
-def call_model(messages):
-    payload = {
-        "model": MODEL,
-        "messages": messages,
-        "tools": TOOLS,
-        "stream": False,
-        "options": {
-            "temperature": 0
-        }
-    }
+def encode_image(path):
+    return base64.b64encode(
+        Path(path).read_bytes()
+    ).decode("utf-8")
 
-    payload_bytes = json.dumps(payload).encode("utf-8")
 
-    request = urllib.request.Request(
-        OLLAMA_URL,
-        data=payload_bytes,
-        headers={
-            "Content-Type": "application/json"
-        },
-        method="POST"
+def compact_old_images(messages):
+    """
+    Keep a rolling window of recent camera images in the Ollama request.
+
+    All action/tool history remains in the conversation. For camera observations,
+    the newest IMAGE_HISTORY_LIMIT observations keep their actual image payloads.
+    Older image payloads are removed only to keep the multimodal context bounded;
+    their place in the history is retained as text.
+
+    This lets the model visually compare several recent viewpoints and notice
+    loops/revisits instead of seeing only the newest frame.
+    """
+    image_indices = [
+        index
+        for index, message in enumerate(messages)
+        if message.get("images")
+    ]
+
+    keep_image_indices = set(
+        image_indices[-IMAGE_HISTORY_LIMIT:]
     )
 
-    start_time = time.perf_counter()
+    compacted = []
 
-    with urllib.request.urlopen(request) as response:
-        response_body = response.read()
-        result = json.loads(response_body)
+    for index, message in enumerate(messages):
+        copied = dict(message)
 
-    wall_ms = (time.perf_counter() - start_time) * 1000.0
+        if (
+            copied.get("images")
+            and index not in keep_image_indices
+        ):
+            copied.pop("images", None)
+            copied["content"] = (
+                "Older camera observation. Its image payload was removed "
+                "only because the rolling visual-history window was exceeded."
+            )
 
-    return result, wall_ms
+        compacted.append(copied)
 
-
-def get_tool_call(response):
-    tool_calls = response["message"].get("tool_calls", [])
-
-    if not tool_calls:
-        return None, {}
-
-    function = tool_calls[0]["function"]
-
-    return function["name"], function.get("arguments", {})
+    return compacted
 
 
-# ============================================================
-# PHASE 1
-# Single-step correctness
-# ============================================================
+class HumanRobotGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Human Robot Test")
+        self.root.geometry("980x760")
 
-def validate_arguments(expected_tool, expected_value, arguments):
-    if expected_tool in ["observe", "get_distance", "stop"]:
-        return arguments == {}
+        self.messages = []
+        self.current_tool = None
+        self.current_arguments = {}
+        self.current_assistant_message = None
+        self.step_count = 0
+        self.must_observe_after_move = False
+        self.observation_paths = []
 
-    if expected_tool in ["turn_left", "turn_right"]:
-        actual_angle = arguments.get("angle_degrees")
+        self.worker_queue = queue.Queue()
 
-        if actual_angle is None:
-            return False
+        self.build_ui()
+        self.poll_worker_queue()
 
-        return abs(float(actual_angle) - expected_value) <= 5.0
+    def build_ui(self):
+        # ---------- palette ----------
+        self.COLORS = {
+            "bg": "#0B0F14",
+            "panel": "#111821",
+            "panel_2": "#151E29",
+            "border": "#263241",
+            "text": "#F3F7FB",
+            "muted": "#91A0B2",
+            "accent": "#4DA3FF",
+            "accent_hover": "#6BB2FF",
+            "success": "#53D769",
+            "warning": "#FFB84D",
+            "danger": "#FF5D5D",
+            "input": "#0F151D",
+        }
 
-    if expected_tool == "move_forward":
-        actual_distance = arguments.get("distance_cm")
+        self.root.configure(
+            bg=self.COLORS["bg"]
+        )
 
-        if actual_distance is None:
-            return False
+        self.root.geometry("1320x860")
+        self.root.minsize(1100, 720)
 
-        return abs(float(actual_distance) - expected_value) <= 10.0
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
 
-    return False
-
-
-def run_single_test(
-    name,
-    observation,
-    expected_tool,
-    expected_value=None
-):
-    messages = [
-        {
-            "role": "user",
-            "content":
-                "Go in front of the dustbin and stop about "
-                "5 cm away."
-        },
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {
-                    "function": {
-                        "name": "observe",
-                        "arguments": {}
-                    }
-                }
+        style.configure(
+            "Dark.TFrame",
+            background=self.COLORS["bg"]
+        )
+        style.configure(
+            "Card.TFrame",
+            background=self.COLORS["panel"]
+        )
+        style.configure(
+            "SubCard.TFrame",
+            background=self.COLORS["panel_2"]
+        )
+        style.configure(
+            "Dark.TLabel",
+            background=self.COLORS["bg"],
+            foreground=self.COLORS["text"]
+        )
+        style.configure(
+            "Card.TLabel",
+            background=self.COLORS["panel"],
+            foreground=self.COLORS["text"]
+        )
+        style.configure(
+            "Muted.TLabel",
+            background=self.COLORS["panel"],
+            foreground=self.COLORS["muted"]
+        )
+        style.configure(
+            "Action.TLabel",
+            background=self.COLORS["panel"],
+            foreground=self.COLORS["text"],
+            font=("Sans", 24, "bold")
+        )
+        style.configure(
+            "Accent.TButton",
+            font=("Sans", 11, "bold"),
+            padding=(16, 10),
+            background=self.COLORS["accent"],
+            foreground="#06111D",
+            borderwidth=0
+        )
+        style.map(
+            "Accent.TButton",
+            background=[
+                ("active", self.COLORS["accent_hover"]),
+                ("disabled", "#33465A")
+            ],
+            foreground=[
+                ("disabled", "#8392A2")
             ]
-        },
-        {
-            "role": "tool",
-            "tool_name": "observe",
-            "content": observation
-        }
-    ]
-
-    response, wall_ms = call_model(messages)
-
-    actual_tool, arguments = get_tool_call(response)
-
-    tool_ok = actual_tool == expected_tool
-
-    args_ok = False
-    if tool_ok:
-        args_ok = validate_arguments(
-            expected_tool,
-            expected_value,
-            arguments
+        )
+        style.configure(
+            "Secondary.TButton",
+            font=("Sans", 10, "bold"),
+            padding=(13, 9),
+            background=self.COLORS["panel_2"],
+            foreground=self.COLORS["text"],
+            borderwidth=1
+        )
+        style.map(
+            "Secondary.TButton",
+            background=[
+                ("active", "#202B38")
+            ]
+        )
+        style.configure(
+            "Dark.TEntry",
+            fieldbackground=self.COLORS["input"],
+            foreground=self.COLORS["text"],
+            insertcolor=self.COLORS["text"],
+            bordercolor=self.COLORS["border"],
+            lightcolor=self.COLORS["border"],
+            darkcolor=self.COLORS["border"],
+            padding=9
         )
 
-    passed = tool_ok and args_ok
-
-    print()
-    print("=" * 60)
-    print(name)
-    print("=" * 60)
-    print(f"Observation    : {observation}")
-    print(f"Expected tool  : {expected_tool}")
-    print(f"Expected value : {expected_value}")
-    print(f"Actual tool    : {actual_tool}")
-    print(f"Arguments      : {arguments}")
-    print(f"Tool correct   : {'YES' if tool_ok else 'NO'}")
-    print(f"Args correct   : {'YES' if args_ok else 'NO'}")
-    print(f"Latency        : {wall_ms:.1f} ms")
-    print(f"Result         : {'PASS' if passed else 'FAIL'}")
-
-    return passed, wall_ms
-
-
-def run_phase_1():
-    tests = [
-        (
-            "Right 10 degrees",
-            "The dustbin is visible 10 degrees to the right.",
-            "turn_right",
-            10
-        ),
-        (
-            "Right 30 degrees",
-            "The dustbin is visible 30 degrees to the right.",
-            "turn_right",
-            30
-        ),
-        (
-            "Right 70 degrees",
-            "The dustbin is visible 70 degrees to the right.",
-            "turn_right",
-            70
-        ),
-
-        (
-            "Left 10 degrees",
-            "The dustbin is visible 10 degrees to the left.",
-            "turn_left",
-            10
-        ),
-        (
-            "Left 30 degrees",
-            "The dustbin is visible 30 degrees to the left.",
-            "turn_left",
-            30
-        ),
-        (
-            "Left 70 degrees",
-            "The dustbin is visible 70 degrees to the left.",
-            "turn_left",
-            70
-        ),
-
-        (
-            "Centered, distance unknown",
-            "The dustbin is centered directly ahead. "
-            "Distance is unknown.",
-            "get_distance",
-            None
-        ),
-
-        (
-            "Centered, 200 cm",
-            "The dustbin is centered directly ahead. "
-            "Ultrasonic distance is 200 cm.",
-            "move_forward",
-            195
-        ),
-
-        (
-            "Centered, 100 cm",
-            "The dustbin is centered directly ahead. "
-            "Ultrasonic distance is 100 cm.",
-            "move_forward",
-            95
-        ),
-
-        (
-            "Centered, 25 cm",
-            "The dustbin is centered directly ahead. "
-            "Ultrasonic distance is 25 cm.",
-            "move_forward",
-            20
-        ),
-
-        (
-            "At target distance",
-            "The dustbin is centered directly ahead. "
-            "Ultrasonic distance is 5 cm.",
-            "stop",
-            None
+        shell = tk.Frame(
+            self.root,
+            bg=self.COLORS["bg"]
         )
-    ]
-
-    passed_count = 0
-    latencies = []
-
-    for name, observation, expected_tool, expected_value in tests:
-        passed, wall_ms = run_single_test(
-            name,
-            observation,
-            expected_tool,
-            expected_value
+        shell.pack(
+            fill="both",
+            expand=True,
+            padx=24,
+            pady=20
         )
 
-        latencies.append(wall_ms)
+        # ---------- header ----------
+        header = tk.Frame(
+            shell,
+            bg=self.COLORS["bg"]
+        )
+        header.pack(
+            fill="x",
+            pady=(0, 18)
+        )
 
-        if passed:
-            passed_count += 1
+        header_left = tk.Frame(
+            header,
+            bg=self.COLORS["bg"]
+        )
+        header_left.pack(
+            side="left",
+            fill="x",
+            expand=True
+        )
 
-    print()
-    print("#" * 60)
-    print("PHASE 1 RESULTS")
-    print("#" * 60)
-    print(f"Passed          : {passed_count} / {len(tests)}")
-    print(
-        f"Average latency : "
-        f"{sum(latencies) / len(latencies):.1f} ms"
-    )
-    print(
-        f"Worst latency   : "
-        f"{max(latencies):.1f} ms"
-    )
+        tk.Label(
+            header_left,
+            text="HUMAN // ROBOT",
+            bg=self.COLORS["bg"],
+            fg=self.COLORS["accent"],
+            font=("Sans", 10, "bold")
+        ).pack(
+            anchor="w"
+        )
 
+        tk.Label(
+            header_left,
+            text="Mission Control",
+            bg=self.COLORS["bg"],
+            fg=self.COLORS["text"],
+            font=("Sans", 28, "bold")
+        ).pack(
+            anchor="w",
+            pady=(1, 2)
+        )
 
-# ============================================================
-# PHASE 2
-# Multi-step simulated missions
-# ============================================================
+        tk.Label(
+            header_left,
+            text=(
+                "Qwen decides. You execute the physical primitive. "
+                "The full recent visual context goes back to the model."
+            ),
+            bg=self.COLORS["bg"],
+            fg=self.COLORS["muted"],
+            font=("Sans", 10)
+        ).pack(
+            anchor="w"
+        )
 
-class FakeRobotWorld:
-    def __init__(self, target_angle_deg, distance_cm):
-        self.target_angle_deg = float(target_angle_deg)
-        self.distance_cm = float(distance_cm)
+        header_right = tk.Frame(
+            header,
+            bg=self.COLORS["panel"],
+            highlightbackground=self.COLORS["border"],
+            highlightthickness=1,
+            padx=14,
+            pady=10
+        )
+        header_right.pack(
+            side="right"
+        )
 
-    def describe_scene(self):
-        if abs(self.target_angle_deg) <= ANGLE_TOLERANCE_DEG:
-            direction = "centered directly ahead"
+        tk.Label(
+            header_right,
+            text=MODEL,
+            bg=self.COLORS["panel"],
+            fg=self.COLORS["text"],
+            font=("Sans", 10, "bold")
+        ).pack(
+            anchor="e"
+        )
 
-        elif self.target_angle_deg > 0:
-            direction = (
-                f"{abs(self.target_angle_deg):.1f} "
-                "degrees to the right"
+        self.header_status_label = tk.Label(
+            header_right,
+            text="●  IDLE",
+            bg=self.COLORS["panel"],
+            fg=self.COLORS["muted"],
+            font=("Sans", 9, "bold")
+        )
+        self.header_status_label.pack(
+            anchor="e",
+            pady=(2, 0)
+        )
+
+        # ---------- mission setup ----------
+        setup = tk.Frame(
+            shell,
+            bg=self.COLORS["panel"],
+            highlightbackground=self.COLORS["border"],
+            highlightthickness=1,
+            padx=18,
+            pady=16
+        )
+        setup.pack(
+            fill="x",
+            pady=(0, 14)
+        )
+
+        tk.Label(
+            setup,
+            text="Mission",
+            bg=self.COLORS["panel"],
+            fg=self.COLORS["text"],
+            font=("Sans", 13, "bold")
+        ).grid(
+            row=0,
+            column=0,
+            columnspan=4,
+            sticky="w",
+            pady=(0, 12)
+        )
+
+        tk.Label(
+            setup,
+            text="Goal",
+            bg=self.COLORS["panel"],
+            fg=self.COLORS["muted"],
+            font=("Sans", 9, "bold")
+        ).grid(
+            row=1,
+            column=0,
+            sticky="w",
+            padx=(0, 10)
+        )
+
+        self.goal_var = tk.StringVar(
+            value=(
+                "Go in front of the pen stand "
+                "and stop about 5 cm away."
             )
+        )
 
+        self.goal_entry = ttk.Entry(
+            setup,
+            textvariable=self.goal_var,
+            style="Dark.TEntry"
+        )
+        self.goal_entry.grid(
+            row=1,
+            column=1,
+            sticky="ew",
+            padx=(0, 18)
+        )
+
+        tk.Label(
+            setup,
+            text="Camera",
+            bg=self.COLORS["panel"],
+            fg=self.COLORS["muted"],
+            font=("Sans", 9, "bold")
+        ).grid(
+            row=1,
+            column=2,
+            sticky="w",
+            padx=(0, 10)
+        )
+
+        self.camera_var = tk.StringVar(
+            value=DEFAULT_CAMERA
+        )
+
+        self.camera_entry = ttk.Entry(
+            setup,
+            textvariable=self.camera_var,
+            style="Dark.TEntry",
+            width=16
+        )
+        self.camera_entry.grid(
+            row=1,
+            column=3,
+            sticky="ew"
+        )
+
+        setup.columnconfigure(
+            1,
+            weight=1
+        )
+
+        button_row = tk.Frame(
+            setup,
+            bg=self.COLORS["panel"]
+        )
+        button_row.grid(
+            row=2,
+            column=0,
+            columnspan=4,
+            sticky="w",
+            pady=(14, 0)
+        )
+
+        self.start_button = ttk.Button(
+            button_row,
+            text="Start Mission",
+            command=self.start_mission,
+            style="Accent.TButton"
+        )
+        self.start_button.pack(
+            side="left"
+        )
+
+        self.reset_button = ttk.Button(
+            button_row,
+            text="Reset",
+            command=self.reset,
+            style="Secondary.TButton"
+        )
+        self.reset_button.pack(
+            side="left",
+            padx=(10, 0)
+        )
+
+        # ---------- current action card ----------
+        action_card = tk.Frame(
+            shell,
+            bg=self.COLORS["panel"],
+            highlightbackground=self.COLORS["border"],
+            highlightthickness=1,
+            padx=20,
+            pady=18
+        )
+        action_card.pack(
+            fill="x",
+            pady=(0, 14)
+        )
+
+        action_top = tk.Frame(
+            action_card,
+            bg=self.COLORS["panel"]
+        )
+        action_top.pack(
+            fill="x"
+        )
+
+        tk.Label(
+            action_top,
+            text="CURRENT AI REQUEST",
+            bg=self.COLORS["panel"],
+            fg=self.COLORS["muted"],
+            font=("Sans", 9, "bold")
+        ).pack(
+            side="left"
+        )
+
+        self.step_label = tk.Label(
+            action_top,
+            text="Decision 0 / 40",
+            bg=self.COLORS["panel"],
+            fg=self.COLORS["muted"],
+            font=("Sans", 9)
+        )
+        self.step_label.pack(
+            side="right"
+        )
+
+        self.action_label = tk.Label(
+            action_card,
+            text="Idle",
+            bg=self.COLORS["panel"],
+            fg=self.COLORS["text"],
+            font=("Sans", 24, "bold")
+        )
+        self.action_label.pack(
+            anchor="w",
+            pady=(8, 3)
+        )
+
+        self.detail_label = tk.Label(
+            action_card,
+            text="Press Start Mission when the scene is ready.",
+            bg=self.COLORS["panel"],
+            fg=self.COLORS["muted"],
+            font=("Sans", 10),
+            justify="left",
+            wraplength=1180
+        )
+        self.detail_label.pack(
+            anchor="w",
+            pady=(0, 13)
+        )
+
+        self.action_controls = tk.Frame(
+            action_card,
+            bg=self.COLORS["panel"]
+        )
+        self.action_controls.pack(
+            fill="x"
+        )
+
+        self.action_button = ttk.Button(
+            self.action_controls,
+            text="",
+            state="disabled",
+            command=self.handle_action_button,
+            style="Accent.TButton"
+        )
+        self.action_button.pack(
+            side="left"
+        )
+
+        self.distance_frame = tk.Frame(
+            self.action_controls,
+            bg=self.COLORS["panel"]
+        )
+
+        tk.Label(
+            self.distance_frame,
+            text="Distance",
+            bg=self.COLORS["panel"],
+            fg=self.COLORS["muted"],
+            font=("Sans", 9, "bold")
+        ).pack(
+            side="left",
+            padx=(0, 8)
+        )
+
+        self.distance_var = tk.StringVar()
+
+        self.distance_entry = ttk.Entry(
+            self.distance_frame,
+            textvariable=self.distance_var,
+            style="Dark.TEntry",
+            width=10
+        )
+        self.distance_entry.pack(
+            side="left"
+        )
+
+        tk.Label(
+            self.distance_frame,
+            text="cm",
+            bg=self.COLORS["panel"],
+            fg=self.COLORS["muted"],
+            font=("Sans", 9)
+        ).pack(
+            side="left",
+            padx=(6, 10)
+        )
+
+        self.distance_button = ttk.Button(
+            self.distance_frame,
+            text="Submit",
+            command=self.submit_distance,
+            style="Accent.TButton"
+        )
+        self.distance_button.pack(
+            side="left"
+        )
+
+        # ---------- lower two-column area ----------
+        lower = tk.PanedWindow(
+            shell,
+            orient="horizontal",
+            sashwidth=7,
+            sashrelief="flat",
+            bg=self.COLORS["bg"],
+            bd=0
+        )
+        lower.pack(
+            fill="both",
+            expand=True
+        )
+
+        # left column
+        left = tk.Frame(
+            lower,
+            bg=self.COLORS["panel"],
+            highlightbackground=self.COLORS["border"],
+            highlightthickness=1
+        )
+
+        preview_header = tk.Frame(
+            left,
+            bg=self.COLORS["panel"],
+            padx=16,
+            pady=12
+        )
+        preview_header.pack(
+            fill="x"
+        )
+
+        tk.Label(
+            preview_header,
+            text="Latest observation",
+            bg=self.COLORS["panel"],
+            fg=self.COLORS["text"],
+            font=("Sans", 12, "bold")
+        ).pack(
+            side="left"
+        )
+
+        self.preview_meta_label = tk.Label(
+            preview_header,
+            text="No frame",
+            bg=self.COLORS["panel"],
+            fg=self.COLORS["muted"],
+            font=("Sans", 9)
+        )
+        self.preview_meta_label.pack(
+            side="right"
+        )
+
+        preview_body = tk.Frame(
+            left,
+            bg="#070A0E"
+        )
+        preview_body.pack(
+            fill="both",
+            expand=True,
+            padx=14,
+            pady=(0, 14)
+        )
+
+        self.preview_label = tk.Label(
+            preview_body,
+            text="No image captured yet.",
+            bg="#070A0E",
+            fg=self.COLORS["muted"],
+            font=("Sans", 11)
+        )
+        self.preview_label.pack(
+            fill="both",
+            expand=True,
+            padx=10,
+            pady=10
+        )
+
+        # right column
+        right = tk.Frame(
+            lower,
+            bg=self.COLORS["bg"]
+        )
+
+        memory_card = tk.Frame(
+            right,
+            bg=self.COLORS["panel"],
+            highlightbackground=self.COLORS["border"],
+            highlightthickness=1,
+            padx=16,
+            pady=14
+        )
+        memory_card.pack(
+            fill="x",
+            pady=(0, 12)
+        )
+
+        memory_top = tk.Frame(
+            memory_card,
+            bg=self.COLORS["panel"]
+        )
+        memory_top.pack(
+            fill="x"
+        )
+
+        tk.Label(
+            memory_top,
+            text="Visual context sent to Qwen",
+            bg=self.COLORS["panel"],
+            fg=self.COLORS["text"],
+            font=("Sans", 12, "bold")
+        ).pack(
+            side="left"
+        )
+
+        self.context_count_label = tk.Label(
+            memory_top,
+            text="0 / 4 images",
+            bg=self.COLORS["panel"],
+            fg=self.COLORS["accent"],
+            font=("Sans", 10, "bold")
+        )
+        self.context_count_label.pack(
+            side="right"
+        )
+
+        tk.Label(
+            memory_card,
+            text=(
+                "These are the actual recent camera frames retained "
+                "in the multimodal request."
+            ),
+            bg=self.COLORS["panel"],
+            fg=self.COLORS["muted"],
+            font=("Sans", 9),
+            justify="left"
+        ).pack(
+            anchor="w",
+            pady=(4, 8)
+        )
+
+        self.context_text = tk.Text(
+            memory_card,
+            height=5,
+            wrap="none",
+            bg=self.COLORS["input"],
+            fg=self.COLORS["text"],
+            insertbackground=self.COLORS["text"],
+            relief="flat",
+            bd=0,
+            padx=10,
+            pady=8,
+            font=("Monospace", 9),
+            state="disabled"
+        )
+        self.context_text.pack(
+            fill="x"
+        )
+
+        log_card = tk.Frame(
+            right,
+            bg=self.COLORS["panel"],
+            highlightbackground=self.COLORS["border"],
+            highlightthickness=1
+        )
+        log_card.pack(
+            fill="both",
+            expand=True
+        )
+
+        log_header = tk.Frame(
+            log_card,
+            bg=self.COLORS["panel"],
+            padx=16,
+            pady=12
+        )
+        log_header.pack(
+            fill="x"
+        )
+
+        tk.Label(
+            log_header,
+            text="Mission log",
+            bg=self.COLORS["panel"],
+            fg=self.COLORS["text"],
+            font=("Sans", 12, "bold")
+        ).pack(
+            side="left"
+        )
+
+        self.log_text = tk.Text(
+            log_card,
+            wrap="word",
+            state="disabled",
+            bg=self.COLORS["input"],
+            fg="#D8E2EE",
+            insertbackground=self.COLORS["text"],
+            selectbackground="#2D5F8F",
+            relief="flat",
+            bd=0,
+            padx=14,
+            pady=12,
+            font=("Monospace", 9)
+        )
+        self.log_text.pack(
+            fill="both",
+            expand=True,
+            padx=14,
+            pady=(0, 14)
+        )
+
+        lower.add(
+            left,
+            minsize=500,
+            stretch="always"
+        )
+        lower.add(
+            right,
+            minsize=430,
+            stretch="always"
+        )
+
+        # Initial visual-context display.
+        self.update_context_display([])
+
+    def update_context_display(self, context_messages):
+        image_count = sum(
+            1
+            for message in context_messages
+            if message.get("images")
+        )
+
+        retained_paths = self.observation_paths[
+            -IMAGE_HISTORY_LIMIT:
+        ]
+
+        self.context_count_label.configure(
+            text=(
+                f"{image_count} / "
+                f"{IMAGE_HISTORY_LIMIT} images"
+            )
+        )
+
+        self.context_text.configure(
+            state="normal"
+        )
+        self.context_text.delete(
+            "1.0",
+            "end"
+        )
+
+        if not retained_paths:
+            self.context_text.insert(
+                "end",
+                "No camera frames have been sent yet."
+            )
         else:
-            direction = (
-                f"{abs(self.target_angle_deg):.1f} "
-                "degrees to the left"
+            start_number = (
+                len(self.observation_paths)
+                - len(retained_paths)
+                + 1
             )
 
-        return (
-            f"The dustbin is {direction}. "
-            f"Ultrasonic distance is "
-            f"{self.distance_cm:.1f} cm."
+            for offset, path in enumerate(
+                retained_paths
+            ):
+                number = start_number + offset
+                marker = (
+                    "  ← newest"
+                    if offset == len(retained_paths) - 1
+                    else ""
+                )
+                self.context_text.insert(
+                    "end",
+                    f"{number:02d}  {Path(path).name}{marker}\n"
+                )
+
+        self.context_text.configure(
+            state="disabled"
         )
 
-    def execute(self, tool_name, arguments):
-        if tool_name == "observe":
-            return self.describe_scene()
 
-        if tool_name == "get_distance":
-            return (
-                f"Ultrasonic distance is "
-                f"{self.distance_cm:.1f} cm."
+    def log(self, text):
+        self.log_text.configure(
+            state="normal"
+        )
+        self.log_text.insert(
+            "end",
+            text + "\n"
+        )
+        self.log_text.see(
+            "end"
+        )
+        self.log_text.configure(
+            state="disabled"
+        )
+
+    def reset(self):
+        self.messages = []
+        self.current_tool = None
+        self.current_arguments = {}
+        self.current_assistant_message = None
+        self.step_count = 0
+        self.must_observe_after_move = False
+        self.observation_paths = []
+
+        self.action_label.configure(
+            text="Idle",
+            fg=self.COLORS["text"]
+        )
+        self.detail_label.configure(
+            text="Press Start Mission when the scene is ready."
+        )
+        self.action_button.configure(
+            text="",
+            state="disabled"
+        )
+        self.distance_frame.pack_forget()
+        self.start_button.configure(
+            state="normal"
+        )
+
+        self.log_text.configure(
+            state="normal"
+        )
+        self.log_text.delete(
+            "1.0",
+            "end"
+        )
+        self.log_text.configure(
+            state="disabled"
+        )
+
+        self.preview_label.configure(
+            image="",
+            text="No image captured yet."
+        )
+        self.preview_label.image = None
+
+        self.preview_meta_label.configure(
+            text="No frame"
+        )
+
+        self.step_label.configure(
+            text=f"Decision 0 / {MAX_STEPS}"
+        )
+
+        self.header_status_label.configure(
+            text="●  IDLE",
+            fg=self.COLORS["muted"]
+        )
+
+        self.update_context_display([])
+
+    def start_mission(self):
+        goal = self.goal_var.get().strip()
+
+        if not goal:
+            messagebox.showerror(
+                "Missing goal",
+                "Enter a mission goal."
+            )
+            return
+
+        self.reset()
+
+        self.start_button.configure(
+            state="disabled"
+        )
+
+        self.messages = [
+            {
+                "role": "system",
+                "content": ROBOT_POLICY
+            },
+            {
+                "role": "user",
+                "content": goal
+            }
+        ]
+
+        self.log(
+            f"USER: {goal}"
+        )
+
+        self.request_model_decision()
+
+    def request_model_decision(self):
+        if self.step_count >= MAX_STEPS:
+            self.stop_with_error(
+                f"Maximum step count ({MAX_STEPS}) reached."
+            )
+            return
+
+        self.step_count += 1
+
+        self.current_tool = None
+        self.current_arguments = {}
+        self.current_assistant_message = None
+
+        self.action_label.configure(
+            text="Qwen is deciding...",
+            fg=self.COLORS["text"]
+        )
+        self.detail_label.configure(
+            text=f"Decision {self.step_count}"
+        )
+        self.action_button.configure(
+            state="disabled"
+        )
+        self.distance_frame.pack_forget()
+
+        messages_copy = compact_old_images(
+            self.messages
+        )
+
+        image_count = sum(
+            1
+            for message in messages_copy
+            if message.get("images")
+        )
+
+        self.update_context_display(
+            messages_copy
+        )
+
+        retained_paths = self.observation_paths[
+            -IMAGE_HISTORY_LIMIT:
+        ]
+
+        self.log(
+            f"CONTEXT: sending {image_count} camera image(s) to Qwen"
+        )
+
+        for path in retained_paths:
+            self.log(
+                f"  IMAGE: {Path(path).name}"
             )
 
-        if tool_name == "turn_right":
-            angle = float(arguments["angle_degrees"])
+        self.step_label.configure(
+            text=f"Decision {self.step_count} / {MAX_STEPS}"
+        )
+        self.header_status_label.configure(
+            text="●  THINKING",
+            fg=self.COLORS["accent"]
+        )
 
-            self.target_angle_deg -= angle
+        threading.Thread(
+            target=self.model_worker,
+            args=(messages_copy,),
+            daemon=True
+        ).start()
 
-            return (
-                f"Turn right completed. "
-                f"{self.describe_scene()}"
+    def model_worker(self, messages):
+        try:
+            payload = {
+                "model": MODEL,
+                "messages": messages,
+                "tools": TOOLS,
+                "think": False,
+                "stream": False,
+                "options": {
+                    "temperature": 0
+                }
+            }
+
+            request_data = json.dumps(
+                payload
+            ).encode("utf-8")
+
+            request = urllib.request.Request(
+                OLLAMA_URL,
+                data=request_data,
+                headers={
+                    "Content-Type": "application/json"
+                },
+                method="POST"
             )
 
-        if tool_name == "turn_left":
-            angle = float(arguments["angle_degrees"])
+            start = time.perf_counter()
 
-            self.target_angle_deg += angle
-
-            return (
-                f"Turn left completed. "
-                f"{self.describe_scene()}"
-            )
-
-        if tool_name == "move_forward":
-            distance = float(arguments["distance_cm"])
-
-            self.distance_cm -= distance
-
-            return (
-                f"Forward movement completed. "
-                f"{self.describe_scene()}"
-            )
-
-        if tool_name == "stop":
-            return "Robot stopped."
-
-        return f"ERROR: Unknown tool: {tool_name}"
-
-
-def mission_successful(world):
-    angle_ok = (
-        abs(world.target_angle_deg)
-        <= ANGLE_TOLERANCE_DEG
-    )
-
-    distance_ok = (
-        abs(world.distance_cm - GOAL_DISTANCE_CM)
-        <= DISTANCE_TOLERANCE_CM
-    )
-
-    return angle_ok and distance_ok
-
-
-def run_episode(
-    name,
-    start_angle,
-    start_distance
-):
-    print()
-    print("=" * 70)
-    print(f"EPISODE: {name}")
-    print("=" * 70)
-
-    world = FakeRobotWorld(
-        target_angle_deg=start_angle,
-        distance_cm=start_distance
-    )
-
-    messages = [
-        {
-            "role": "user",
-            "content":
-                "Go in front of the dustbin and stop about "
-                "5 cm away."
-        }
-    ]
-
-    total_latency_ms = 0.0
-
-    print(
-        f"Initial world: "
-        f"angle={world.target_angle_deg:.1f}°, "
-        f"distance={world.distance_cm:.1f} cm"
-    )
-
-    for step in range(1, MAX_STEPS + 1):
-        response, wall_ms = call_model(messages)
-
-        total_latency_ms += wall_ms
-
-        tool_name, arguments = get_tool_call(response)
-
-        print()
-        print(f"Step {step}")
-        print(f"  Tool      : {tool_name}")
-        print(f"  Arguments : {arguments}")
-        print(f"  Latency   : {wall_ms:.1f} ms")
-
-        if tool_name is None:
-            print(
-                "  FAIL: model returned no tool call"
-            )
-
-            return False, total_latency_ms, step
-
-        #
-        # Validate movement before executing it.
-        #
-        if tool_name == "move_forward":
-            distance = arguments.get("distance_cm")
-
-            if distance is None:
-                print(
-                    "  FAIL: move_forward missing "
-                    "distance_cm"
+            with urllib.request.urlopen(
+                request,
+                timeout=120
+            ) as response:
+                result = json.loads(
+                    response.read()
                 )
 
-                return False, total_latency_ms, step
+            latency_ms = (
+                time.perf_counter() - start
+            ) * 1000.0
 
-            distance = float(distance)
+            message = result.get(
+                "message",
+                {}
+            )
 
-            if distance <= 0:
-                print(
-                    "  FAIL: forward distance must be "
-                    "positive"
+            tool_calls = message.get(
+                "tool_calls",
+                []
+            )
+
+            if not tool_calls:
+                self.worker_queue.put(
+                    {
+                        "type": "error",
+                        "message": (
+                            "Model returned no tool call.\n\n"
+                            + json.dumps(
+                                message,
+                                indent=2
+                            )
+                        )
+                    }
+                )
+                return
+
+            function = tool_calls[0].get(
+                "function",
+                {}
+            )
+
+            self.worker_queue.put(
+                {
+                    "type": "model",
+                    "tool": function.get(
+                        "name"
+                    ),
+                    "arguments": function.get(
+                        "arguments",
+                        {}
+                    ),
+                    "assistant_message": message,
+                    "latency_ms": latency_ms
+                }
+            )
+
+        except urllib.error.HTTPError as exc:
+            try:
+                body = exc.read().decode(
+                    "utf-8",
+                    errors="replace"
+                )
+            except Exception:
+                body = ""
+
+            message = (
+                f"HTTP Error {exc.code}: {exc.reason}"
+            )
+
+            if body:
+                message += (
+                    "\n\nOllama response:\n"
+                    + body
                 )
 
-                return False, total_latency_ms, step
+            self.worker_queue.put(
+                {
+                    "type": "error",
+                    "message": message
+                }
+            )
 
-            if distance > world.distance_cm:
-                print(
-                    "  FAIL: requested movement would "
-                    "move past the target"
+        except Exception as exc:
+            self.worker_queue.put(
+                {
+                    "type": "error",
+                    "message": str(exc)
+                }
+            )
+
+    def poll_worker_queue(self):
+        try:
+            item = self.worker_queue.get_nowait()
+        except queue.Empty:
+            self.root.after(
+                100,
+                self.poll_worker_queue
+            )
+            return
+
+        if item["type"] == "model":
+            self.handle_model_decision(
+                item
+            )
+
+        elif item["type"] == "capture":
+            self.finish_capture(
+                item["image_path"]
+            )
+
+        elif item["type"] == "error":
+            self.stop_with_error(
+                item["message"]
+            )
+
+        self.root.after(
+            100,
+            self.poll_worker_queue
+        )
+
+    def handle_model_decision(self, item):
+        tool = item["tool"]
+        args = item["arguments"]
+
+        self.current_tool = tool
+        self.current_arguments = args
+        self.current_assistant_message = (
+            item["assistant_message"]
+        )
+
+        if (
+            self.must_observe_after_move
+            and tool != "observe"
+        ):
+            self.log(
+                f"SAFETY: rejected {tool}{args}; "
+                "fresh observation required after movement."
+            )
+
+            self.messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Safety controller rejected that action. "
+                        "The robot moved since the last camera frame, "
+                        "so call observe() now before any other "
+                        "navigation action."
+                    )
+                }
+            )
+
+            self.request_model_decision()
+            return
+
+        self.log(
+            f"AI: {tool}{args} "
+            f"({item['latency_ms']:.1f} ms)"
+        )
+
+        self.header_status_label.configure(
+            text="●  AWAITING YOU",
+            fg=self.COLORS["warning"]
+        )
+
+        self.root.bell()
+
+        if tool == "observe":
+            self.action_label.configure(
+                text="OBSERVE"
+            )
+            self.detail_label.configure(
+                text=(
+                    "Point the webcam where the robot would "
+                    "currently be looking, then capture."
                 )
+            )
+            self.action_button.configure(
+                text="Capture Observation",
+                state="normal"
+            )
+            return
 
-                return False, total_latency_ms, step
+        if tool == "turn_left":
+            angle = args.get(
+                "angle_degrees",
+                "?"
+            )
+            self.action_label.configure(
+                text=f"TURN LEFT {angle}°"
+            )
+            self.detail_label.configure(
+                text=(
+                    f"Rotate the webcam approximately {angle}° "
+                    f"to the LEFT, then confirm."
+                )
+            )
+            self.action_button.configure(
+                text="Movement Complete",
+                state="normal"
+            )
+            return
 
-        #
-        # Validate turn command.
-        #
-        if tool_name in [
+        if tool == "turn_right":
+            angle = args.get(
+                "angle_degrees",
+                "?"
+            )
+            self.action_label.configure(
+                text=f"TURN RIGHT {angle}°"
+            )
+            self.detail_label.configure(
+                text=(
+                    f"Rotate the webcam approximately {angle}° "
+                    f"to the RIGHT, then confirm."
+                )
+            )
+            self.action_button.configure(
+                text="Movement Complete",
+                state="normal"
+            )
+            return
+
+        if tool == "move_forward":
+            distance = args.get(
+                "distance_cm",
+                "?"
+            )
+
+            self.action_label.configure(
+                text=f"MOVE FORWARD {distance} cm"
+            )
+            self.detail_label.configure(
+                text=(
+                    f"Move the webcam approximately {distance} cm "
+                    f"FORWARD, then confirm."
+                )
+            )
+            self.action_button.configure(
+                text="Movement Complete",
+                state="normal"
+            )
+            return
+
+        if tool == "get_distance":
+            self.action_label.configure(
+                text="MEASURE DISTANCE"
+            )
+            self.detail_label.configure(
+                text=(
+                    "Measure or estimate the distance directly "
+                    "ahead to the target and enter it below."
+                )
+            )
+
+            self.distance_var.set("")
+            self.distance_frame.pack(
+                anchor="w"
+            )
+            self.distance_entry.focus_set()
+            return
+
+        if tool == "stop":
+            self.messages.append(
+                self.current_assistant_message
+            )
+
+            self.action_label.configure(
+                text="MISSION COMPLETE",
+                fg=self.COLORS["success"]
+            )
+            self.detail_label.configure(
+                text="Qwen called stop()."
+            )
+            self.header_status_label.configure(
+                text="●  COMPLETE",
+                fg=self.COLORS["success"]
+            )
+            self.action_button.configure(
+                state="disabled"
+            )
+
+            self.log(
+                "MISSION COMPLETE: stop()"
+            )
+
+            self.root.bell()
+
+            messagebox.showinfo(
+                "Mission complete",
+                "Qwen called stop()."
+            )
+            return
+
+        self.stop_with_error(
+            f"Unknown tool requested: {tool}"
+        )
+
+    def handle_action_button(self):
+        if self.current_tool == "observe":
+            self.capture_observation()
+            return
+
+        if self.current_tool in [
             "turn_left",
-            "turn_right"
+            "turn_right",
+            "move_forward"
         ]:
-            angle = arguments.get("angle_degrees")
+            self.complete_movement()
+            return
 
-            if angle is None:
-                print(
-                    "  FAIL: turn missing "
-                    "angle_degrees"
-                )
-
-                return False, total_latency_ms, step
-
-            angle = float(angle)
-
-            if angle <= 0:
-                print(
-                    "  FAIL: turn angle must be positive"
-                )
-
-                return False, total_latency_ms, step
-
-        #
-        # Add model's tool call to conversation history.
-        #
-        messages.append(
-            response["message"]
+    def capture_observation(self):
+        self.action_button.configure(
+            state="disabled"
+        )
+        self.action_label.configure(
+            text="Capturing..."
         )
 
-        #
-        # Execute tool in fake environment.
-        #
-        tool_result = world.execute(
-            tool_name,
-            arguments
+        threading.Thread(
+            target=self.capture_worker,
+            daemon=True
+        ).start()
+
+    def capture_worker(self):
+        try:
+            timestamp = int(
+                time.time() * 1000
+            )
+
+            image_path = (
+                CAPTURE_DIR
+                / f"observation_{timestamp}.png"
+            )
+
+            camera = (
+                self.camera_var.get().strip()
+            )
+
+            command = [
+                "ffmpeg",
+                "-loglevel",
+                "error",
+                "-f",
+                "v4l2",
+                "-i",
+                camera,
+                "-frames:v",
+                "1",
+                "-update",
+                "1",
+                "-y",
+                str(image_path)
+            ]
+
+            subprocess.run(
+                command,
+                check=True,
+                timeout=15
+            )
+
+            self.worker_queue.put(
+                {
+                    "type": "capture",
+                    "image_path": str(
+                        image_path
+                    )
+                }
+            )
+
+        except Exception as exc:
+            self.worker_queue.put(
+                {
+                    "type": "error",
+                    "message": (
+                        "Camera capture failed: "
+                        + str(exc)
+                    )
+                }
+            )
+
+    def finish_capture(self, image_path):
+        self.show_preview(
+            image_path
         )
 
-        print(
-            f"  Tool result: {tool_result}"
+        self.observation_paths.append(
+            image_path
         )
 
-        print(
-            f"  World state: "
-            f"angle={world.target_angle_deg:.1f}°, "
-            f"distance={world.distance_cm:.1f} cm"
+        self.messages.append(
+            self.current_assistant_message
         )
 
-        #
-        # Add tool result to conversation history.
-        #
-        messages.append(
+        self.messages.append(
             {
                 "role": "tool",
-                "tool_name": tool_name,
-                "content": tool_result
+                "tool_name": "observe",
+                "content": (
+                    f"Current camera observation: "
+                    f"{Path(image_path).name}"
+                ),
+                "images": [
+                    encode_image(
+                        image_path
+                    )
+                ]
             }
         )
 
-        #
-        # If model decided to stop, determine whether
-        # it actually completed the mission.
-        #
-        if tool_name == "stop":
-            passed = mission_successful(world)
+        self.log(
+            f"TOOL: observe() -> {image_path}"
+        )
 
-            print()
+        self.must_observe_after_move = False
 
-            if passed:
-                print("EPISODE RESULT: PASS")
+        self.request_model_decision()
 
-            else:
-                print("EPISODE RESULT: FAIL")
-                print(
-                    "Model stopped, but robot was not "
-                    "at the required goal."
-                )
-
-            return (
-                passed,
-                total_latency_ms,
-                step
+    def show_preview(self, image_path):
+        try:
+            photo = tk.PhotoImage(
+                file=image_path
             )
 
-    print()
-    print("EPISODE RESULT: FAIL")
-    print(
-        "Reason: maximum number of steps reached"
-    )
+            max_width = 760
+            max_height = 520
 
-    return (
-        False,
-        total_latency_ms,
-        MAX_STEPS
-    )
+            x_scale = max(
+                1,
+                photo.width()
+                // max_width
+            )
 
+            y_scale = max(
+                1,
+                photo.height()
+                // max_height
+            )
 
-def run_phase_2():
-    episodes = [
-        (
-            "Target far right and far away",
-            40,
-            150
-        ),
+            scale = max(
+                x_scale,
+                y_scale
+            )
 
-        (
-            "Target far left and far away",
-            -60,
-            120
-        ),
+            if scale > 1:
+                photo = photo.subsample(
+                    scale,
+                    scale
+                )
 
-        (
-            "Target slightly right",
-            10,
-            80
-        ),
+            self.preview_label.configure(
+                image=photo,
+                text=""
+            )
+            self.preview_label.image = photo
 
-        (
-            "Target slightly left",
-            -15,
-            50
-        ),
+            self.preview_meta_label.configure(
+                text=Path(image_path).name
+            )
 
-        (
-            "Already centered but far",
-            0,
-            100
-        ),
+        except Exception as exc:
+            self.preview_label.configure(
+                text=(
+                    f"Captured:\n{image_path}\n\n"
+                    f"Preview unavailable:\n{exc}"
+                ),
+                image=""
+            )
 
-        (
-            "Centered and close",
-            0,
-            25
-        ),
+    def complete_movement(self):
+        tool = self.current_tool
+        args = self.current_arguments
 
-        (
-            "Already at goal",
-            0,
-            5
-        )
-    ]
-
-    passed_count = 0
-    mission_latencies = []
-    mission_steps = []
-
-    for name, angle, distance in episodes:
-        passed, latency_ms, steps = run_episode(
-            name,
-            angle,
-            distance
+        self.messages.append(
+            self.current_assistant_message
         )
 
-        mission_latencies.append(
-            latency_ms
-        )
+        if tool == "turn_left":
+            value = args.get(
+                "angle_degrees"
+            )
+            result = (
+                f"Turn left by {value} degrees completed."
+            )
 
-        mission_steps.append(
-            steps
-        )
+        elif tool == "turn_right":
+            value = args.get(
+                "angle_degrees"
+            )
+            result = (
+                f"Turn right by {value} degrees completed."
+            )
 
-        if passed:
-            passed_count += 1
+        elif tool == "move_forward":
+            distance = args.get(
+                "distance_cm"
+            )
 
-    print()
-    print("#" * 70)
-    print("PHASE 2 RESULTS")
-    print("#" * 70)
+            result = (
+                f"Forward movement of {distance} cm completed."
+            )
 
-    print(
-        f"Passed                 : "
-        f"{passed_count} / {len(episodes)}"
-    )
+            self.must_observe_after_move = True
 
-    print(
-        f"Average mission latency: "
-        f"{sum(mission_latencies) / len(mission_latencies):.1f} ms"
-    )
-
-    print(
-        f"Average steps          : "
-        f"{sum(mission_steps) / len(mission_steps):.1f}"
-    )
-
-# ============================================================
-# PHASE 3
-# Wording / language robustness
-# ============================================================
-
-def run_robustness_test(
-    name,
-    user_goal,
-    observation,
-    expected_tool,
-    expected_value=None
-):
-    messages = [
-        {
-            "role": "user",
-            "content": user_goal
-        },
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {
-                    "function": {
-                        "name": "observe",
-                        "arguments": {}
-                    }
-                }
-            ]
-        },
-        {
-            "role": "tool",
-            "tool_name": "observe",
-            "content": observation
-        }
-    ]
-
-    response, wall_ms = call_model(messages)
-
-    actual_tool, arguments = get_tool_call(response)
-
-    tool_ok = actual_tool == expected_tool
-
-    args_ok = False
-
-    if tool_ok:
-        args_ok = validate_arguments(
-            expected_tool,
-            expected_value,
-            arguments
-        )
-
-    passed = tool_ok and args_ok
-
-    print()
-    print("=" * 70)
-    print(name)
-    print("=" * 70)
-    print(f"Goal           : {user_goal}")
-    print(f"Observation    : {observation}")
-    print(f"Expected tool  : {expected_tool}")
-    print(f"Expected value : {expected_value}")
-    print(f"Actual tool    : {actual_tool}")
-    print(f"Arguments      : {arguments}")
-    print(f"Latency        : {wall_ms:.1f} ms")
-    print(f"Result         : {'PASS' if passed else 'FAIL'}")
-
-    return passed, wall_ms
-
-
-def run_phase_3():
-
-    tests = [
-
-        # ----------------------------------------------------
-        # SAME physical situation:
-        # target is 30 degrees RIGHT
-        # ----------------------------------------------------
-
-        (
-            "Right - normal wording",
-            "Go in front of the dustbin and stop about 5 cm away.",
-            "The dustbin is 30 degrees to the right.",
-            "turn_right",
-            30
-        ),
-
-        (
-            "Right - casual wording",
-            "Drive over to the trash can and stop around 5 cm from it.",
-            "The trash can is off to your right by roughly 30 degrees.",
-            "turn_right",
-            30
-        ),
-
-        (
-            "Right - short wording",
-            "Go to the bin. Stop 5 cm away.",
-            "Bin is about 30 degrees on the right.",
-            "turn_right",
-            30
-        ),
-
-        (
-            "Right - technical wording",
-            "Approach the target and finish 5 cm in front of it.",
-            "Target bearing is +30 degrees, where positive means right.",
-            "turn_right",
-            30
-        ),
-
-        (
-            "Right - different object word",
-            "Position yourself 5 cm in front of the garbage bin.",
-            "The garbage bin appears roughly 30 degrees to your right.",
-            "turn_right",
-            30
-        ),
-
-
-        # ----------------------------------------------------
-        # Target is 30 degrees LEFT
-        # ----------------------------------------------------
-
-        (
-            "Left - normal wording",
-            "Go in front of the dustbin and stop about 5 cm away.",
-            "The dustbin is 30 degrees to the left.",
-            "turn_left",
-            30
-        ),
-
-        (
-            "Left - casual wording",
-            "Drive over to the trash can and stop around 5 cm from it.",
-            "The trash can is off to your left by roughly 30 degrees.",
-            "turn_left",
-            30
-        ),
-
-        (
-            "Left - short wording",
-            "Go to the bin. Stop 5 cm away.",
-            "Bin is about 30 degrees on the left.",
-            "turn_left",
-            30
-        ),
-
-        (
-            "Left - technical wording",
-            "Approach the target and finish 5 cm in front of it.",
-            "Target bearing is -30 degrees, where negative means left.",
-            "turn_left",
-            30
-        ),
-
-        (
-            "Left - different object word",
-            "Position yourself 5 cm in front of the garbage bin.",
-            "The garbage bin appears roughly 30 degrees to your left.",
-            "turn_left",
-            30
-        ),
-
-
-        # ----------------------------------------------------
-        # Centered, but distance unknown
-        # ----------------------------------------------------
-
-        (
-            "Unknown range - normal wording",
-            "Go in front of the dustbin and stop about 5 cm away.",
-            "The dustbin is centered directly ahead. "
-            "Its distance is not known.",
-            "get_distance",
-            None
-        ),
-
-        (
-            "Unknown range - casual wording",
-            "Move up to the trash can and leave about a 5 cm gap.",
-            "The trash can is straight ahead, but I do not know "
-            "how far away it is.",
-            "get_distance",
-            None
-        ),
-
-        (
-            "Unknown range - technical wording",
-            "Approach the target until range is approximately 5 cm.",
-            "Target bearing is zero degrees. Range information "
-            "is unavailable.",
-            "get_distance",
-            None
-        ),
-
-
-        # ----------------------------------------------------
-        # Centered and FAR
-        # ----------------------------------------------------
-
-        (
-            "Far - normal wording",
-            "Go in front of the dustbin and stop about 5 cm away.",
-            "The dustbin is centered directly ahead. "
-            "Ultrasonic distance is 100 cm.",
-            "move_forward",
-            95
-        ),
-
-        (
-            "Far - casual wording",
-            "Drive up to the trash can, but leave a 5 cm gap.",
-            "The trash can is straight in front of you and "
-            "is 100 cm away.",
-            "move_forward",
-            95
-        ),
-
-        (
-            "Far - technical wording",
-            "Approach the target and maintain a final range of 5 cm.",
-            "Target bearing is 0 degrees. Current range is 100 cm.",
-            "move_forward",
-            95
-        ),
-
-        (
-            "Far - alternate units wording",
-            "Get in front of the bin and stop 5 centimeters away.",
-            "The bin is centered. The measured distance "
-            "to it is 100 centimeters.",
-            "move_forward",
-            95
-        ),
-
-
-        # ----------------------------------------------------
-        # Centered and CLOSE
-        # ----------------------------------------------------
-
-        (
-            "Close - normal wording",
-            "Go in front of the dustbin and stop about 5 cm away.",
-            "The dustbin is centered directly ahead. "
-            "Ultrasonic distance is 25 cm.",
-            "move_forward",
-            20
-        ),
-
-        (
-            "Close - casual wording",
-            "Get close to the trash can and leave about 5 cm.",
-            "The trash can is straight ahead and only "
-            "25 cm away.",
-            "move_forward",
-            20
-        ),
-
-        (
-            "Close - technical wording",
-            "Approach the target to a final range of 5 cm.",
-            "Target bearing is zero. Current range is 25 cm.",
-            "move_forward",
-            20
-        ),
-
-
-        # ----------------------------------------------------
-        # Already at target
-        # ----------------------------------------------------
-
-        (
-            "Goal reached - normal wording",
-            "Go in front of the dustbin and stop about 5 cm away.",
-            "The dustbin is centered directly ahead. "
-            "Ultrasonic distance is 5 cm.",
-            "stop",
-            None
-        ),
-
-        (
-            "Goal reached - casual wording",
-            "Drive up to the trash can and leave a 5 cm gap.",
-            "The trash can is directly ahead and exactly "
-            "5 cm away.",
-            "stop",
-            None
-        ),
-
-        (
-            "Goal reached - technical wording",
-            "Approach the target until range is 5 cm.",
-            "Target bearing is zero degrees. "
-            "Current range is 5 cm.",
-            "stop",
-            None
-        )
-    ]
-
-    passed_count = 0
-    latencies = []
-
-    failed_tests = []
-
-    for (
-        name,
-        user_goal,
-        observation,
-        expected_tool,
-        expected_value
-    ) in tests:
-
-        passed, wall_ms = run_robustness_test(
-            name,
-            user_goal,
-            observation,
-            expected_tool,
-            expected_value
-        )
-
-        latencies.append(wall_ms)
-
-        if passed:
-            passed_count += 1
         else:
-            failed_tests.append(name)
+            self.stop_with_error(
+                "Unexpected movement tool."
+            )
+            return
 
-    print()
-    print("#" * 70)
-    print("PHASE 3 RESULTS")
-    print("#" * 70)
+        self.messages.append(
+            {
+                "role": "tool",
+                "tool_name": tool,
+                "content": result
+            }
+        )
 
-    print(
-        f"Passed          : "
-        f"{passed_count} / {len(tests)}"
-    )
+        self.log(
+            f"TOOL: {result}"
+        )
 
-    print(
-        f"Success rate    : "
-        f"{100.0 * passed_count / len(tests):.1f}%"
-    )
+        self.request_model_decision()
 
-    print(
-        f"Average latency : "
-        f"{sum(latencies) / len(latencies):.1f} ms"
-    )
+    def submit_distance(self):
+        raw = self.distance_var.get().strip()
 
-    print(
-        f"Worst latency   : "
-        f"{max(latencies):.1f} ms"
-    )
+        try:
+            distance = float(
+                raw
+            )
+        except ValueError:
+            messagebox.showerror(
+                "Invalid distance",
+                "Enter a number such as 82 or 5.5."
+            )
+            return
 
-    if failed_tests:
-        print()
-        print("FAILED TESTS:")
+        if distance < 0:
+            messagebox.showerror(
+                "Invalid distance",
+                "Distance cannot be negative."
+            )
+            return
 
-        for name in failed_tests:
-            print(f"  - {name}")
+        self.messages.append(
+            self.current_assistant_message
+        )
 
-# ============================================================
-# MAIN
-# ============================================================
+        result = (
+            f"Ultrasonic distance is "
+            f"{distance:.1f} cm."
+        )
+
+        self.messages.append(
+            {
+                "role": "tool",
+                "tool_name": "get_distance",
+                "content": result
+            }
+        )
+
+        self.log(
+            f"TOOL: {result}"
+        )
+
+        self.distance_frame.pack_forget()
+
+        self.request_model_decision()
+
+    def stop_with_error(self, message):
+        self.current_tool = None
+
+        self.action_label.configure(
+            text="TEST STOPPED",
+            fg=self.COLORS["danger"]
+        )
+        self.header_status_label.configure(
+            text="●  STOPPED",
+            fg=self.COLORS["danger"]
+        )
+        self.detail_label.configure(
+            text=message
+        )
+        self.action_button.configure(
+            state="disabled"
+        )
+        self.distance_frame.pack_forget()
+        self.start_button.configure(
+            state="normal"
+        )
+
+        self.log(
+            f"ERROR: {message}"
+        )
+
+        messagebox.showerror(
+            "Test stopped",
+            message
+        )
+
+
+def main():
+    root = tk.Tk()
+    HumanRobotGUI(root)
+    root.mainloop()
+
+
 if __name__ == "__main__":
-    run_phase_1()
-    run_phase_2()
-    run_phase_3()
+    main()
