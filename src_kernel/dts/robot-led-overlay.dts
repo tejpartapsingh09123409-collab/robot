@@ -1,0 +1,28 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "brcm,bcm2711";
+
+    fragment@0{
+        target = <&spi0>;
+
+        __overlay__{
+            status = "okay";
+
+            robot_led@0{
+                compatible = "tej,robot-led";
+                reg = <0>;
+                spi-max-frequency = <6400000>;
+            };
+        };
+    };   
+
+    fragment@1 {
+        target = <&spidev0>;
+
+        __overlay__ {
+            status = "disabled";
+        };
+    };
+};
