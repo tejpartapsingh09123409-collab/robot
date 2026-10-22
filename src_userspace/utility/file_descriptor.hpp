@@ -1,3 +1,7 @@
+#pragma once
+
+#include <unistd.h>
+
 class FileDescriptor{
     public:
         explicit FileDescriptor(int fd):

@@ -1,17 +1,13 @@
-
+#include "led_controller.hpp"
 
 int main(){
-    LedController leds{"dev/led_node"};
+    LedController leds{"/dev/robot_led"};
 
+    Rgb rgb_led{.r = 0xFF, 
+                .g= 0xFF,
+                .b= 0xFF};
 
-
-    while(1){
-        Rgb rgb_led{.red = 0xFF, 
-                    .green = 0xFF,
-                    .blue = 0xFF};
-
-        leds.set(rgb_led);
-    }
+    leds.set(rgb_led);
 
     return 0;
 }

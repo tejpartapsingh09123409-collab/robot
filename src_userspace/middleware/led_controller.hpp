@@ -1,4 +1,19 @@
+#pragma once
+
 #include "file_descriptor.hpp"
+
+#include <array>
+#include <cerrno>
+#include <cstdint>
+#include <string>
+#include <system_error>
+#include <stdexcept>
+#include <cstddef>
+
+#include <fcntl.h>
+#include <unistd.h>
+
+#include "rgb.hpp"
 
 class LedController{
     public:
@@ -13,38 +28,30 @@ class LedController{
                                                     rgb_led.g,
                                                     rgb_led.b};
 
-            std::size_t bytes_to_write{sizeof(led_data)};
-            std::size_t total_bytes_written{0};
             
-            while(bytes_to_write > 0 ){
-                            
-                const ssize_t bytes_written{::write(led_driver_fd_.get(),
-                                    &(led_data[total_bytes_written]), 
-                                    bytes_to_write)};
+            ssize_t bytes_written;
 
-                if(bytes_written < 0){
-                    if(errno == EINTR){
-                        // Interrupted by a signal
-                        // Retry
-                        continue;
-                    }
+            do {
+                bytes_written = ::write(
+                    led_driver_fd_.get(),
+                    led_data.data(),
+                    led_data.size()
+                );
+            } while (bytes_written < 0 && errno == EINTR);
 
+            if(bytes_written < 0){
 
-                    throw std::system_error{
-                        errno,
-                        std::generic_category(),
-                        "Led write failed"
-                    };
-                }
-                else if(bytes_written == 0){
-                    throw std::runtime_error{
-                        "No led data written"
-                    };
-                }
+                throw std::system_error{
+                    errno,
+                    std::generic_category(),
+                    "Led write failed"
+                };
+            }
 
-
-                bytes_to_write = bytes_to_write - bytes_written;
-                total_bytes_written += bytes_written;
+            if(static_cast<std::size_t>(bytes_written) != led_data.size()){
+                throw std::runtime_error{
+                    "Incomplete LED cmd written"
+                };
             }
         }
 
@@ -52,7 +59,7 @@ class LedController{
         FileDescriptor led_driver_fd_;
 
         static int open_led_driver(const std::string &dev_node_name){
-            const int fd{::open(dev_node_name.c_str(), O_RDWR);}
+            const int fd{::open(dev_node_name.c_str(), O_WRONLY)};
             if(fd < 0){
                 throw std::system_error{
                     errno,
@@ -60,7 +67,6 @@ class LedController{
                     "Led device open failed"
                 };
             }
-
             return fd;
         }
 

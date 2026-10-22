@@ -1,3 +1,49 @@
+# =====================================
+# C/C++ build artifacts
+# =====================================
+*.o
+*.d
+*.a
+*.so
+*.so.*
+*.out
+
+# =====================================
+# Linux kernel module build artifacts
+# =====================================
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.cmd
+*.symvers
+Module.symvers
+modules.order
+.tmp_versions/
+.tmp_objects/
+
+# =====================================
+# Device Tree compiled binaries
+# =====================================
+*.dtbo
+*.dtb
+
+# =====================================
+# Userspace executables
+# =====================================
+/src_userspace/led_controller
+
+# =====================================
+# Editor temporary files
+# =====================================
+*.swp
+*.swo
+*~
+
+# =====================================
+# Test data
+# =====================================
 tests/ai/images/
 tests/ai/human_robot_captures/
 robot_captures/
+
