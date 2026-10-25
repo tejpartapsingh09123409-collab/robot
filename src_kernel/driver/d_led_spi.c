@@ -18,8 +18,11 @@ struct led_spi_device {
 
     dev_t dev_num;
     struct cdev cdev;
+
+    struct device *device; 
 };
 
+static struct class *robot_led_class;
 static int led_spi_probe(struct spi_device *spi);
 static void led_spi_remove(struct spi_device *spi);
 
@@ -36,9 +39,22 @@ static struct spi_driver led_spi_driver = {
 static int led_spi_set_all(struct spi_device *spi, const u8 rgb[3]);
 
 static int __init led_spi_init(void){
-    printk(KERN_INFO "Led Spi driver modprobed\n");
+    int ret;
 
-    return spi_register_driver(&led_spi_driver);
+    printk(KERN_INFO "Led Spi driver modprobed\n");
+    robot_led_class = class_create("robot_led");
+
+    if(IS_ERR(robot_led_class)){
+        return PTR_ERR(robot_led_class);
+    }
+
+    ret = spi_register_driver(&led_spi_driver);
+    if(ret){
+        class_destroy(robot_led_class);
+        return ret;
+    }
+
+    return 0;
 }
 
 static int robot_led_open(struct inode *inode, struct file *filp);
@@ -102,9 +118,20 @@ static int led_spi_probe(struct spi_device *spi)
         dev_err(&spi->dev, "cdev_add failed: %d\n", ret);
         unregister_chrdev_region(led->dev_num, 1);
         return ret;
-        
     }
 
+    led->device = device_create(robot_led_class,
+        &spi->dev,
+        led->dev_num,
+        NULL,
+        "robot_led");
+
+    if(IS_ERR(led->device)){
+        ret = PTR_ERR(led->device);
+        cdev_del(&led->cdev);
+        unregister_chrdev_region(led->dev_num, 1);
+        return ret;
+    }
 
     printk(KERN_INFO "LEDs turned ON\n");
 
@@ -116,6 +143,8 @@ static void led_spi_remove(struct spi_device *spi)
 {
     struct led_spi_device *led = spi_get_drvdata(spi);
 
+    device_destroy(robot_led_class, led->dev_num);
+
     cdev_del(&led->cdev);
     unregister_chrdev_region(led->dev_num, 1);
 
@@ -126,6 +155,8 @@ static void __exit led_spi_exit(void){
     printk(KERN_INFO "Led spi driver rmmoded\n");
 
     spi_unregister_driver(&led_spi_driver);
+
+    class_destroy(robot_led_class);
 }
 
 // userspace functions
